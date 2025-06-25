@@ -1,0 +1,728 @@
+# admin_gui.py (Versão Completa com CRUD, RFID, Relatórios e Maximizada)
+
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+import mysql.connector
+from mysql.connector import Error
+from passlib.hash import bcrypt # Para senhas
+import re # Para validação de email (regex)
+from tkcalendar import DateEntry # Para seleção de datas
+from datetime import datetime
+
+# --- Configurações do Banco de Dados ---
+# Usando os dados que você forneceu
+DB_CONFIG = {
+    'host': 'localhost',    # Ou 127.0.0.1
+    'user': 'root',
+    'password': '8488', # Sua senha MySQL
+    'database': 'relogio_ponto'
+}
+
+# --- Funções Auxiliares do Banco de Dados ---
+
+def conectar_db():
+    """Tenta conectar ao banco de dados e retorna o objeto de conexão."""
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG, use_pure=False)
+        return conn
+    except Error as err:
+        if err.errno == mysql.connector.errorcode.CR_CONN_HOST_ERROR or \
+           err.errno == mysql.connector.errorcode.CR_CONNECTION_ERROR or \
+           err.errno == 1045: # Access denied
+             messagebox.showerror("Erro de Conexão", f"Não foi possível conectar ao MySQL:\n{err}")
+        else:
+            print(f"DEBUG DB Error (conectar_db): {err}")
+        return None
+
+def executar_query(query, params=None, fetch_one=False, fetch_all=False, commit=False):
+    """Função genérica para executar queries SQL."""
+    conn = conectar_db()
+    if conn is None: return None
+    resultado = None
+    last_row_id = None
+    cursor = None
+    try:
+        cursor = conn.cursor(dictionary=True if (fetch_one or fetch_all) else False)
+        cursor.execute(query, params or ())
+
+        if commit:
+            conn.commit()
+            last_row_id = cursor.lastrowid
+            resultado = last_row_id if last_row_id else True
+        elif fetch_one:
+            resultado = cursor.fetchone()
+        elif fetch_all:
+            resultado = cursor.fetchall()
+
+    except Error as err:
+        if conn: conn.rollback()
+        print(f"Erro SQL: {err}")
+        if err.errno == 1062:
+             messagebox.showerror("Erro de Duplicidade", f"Erro: Já existe um registro com esses dados únicos.\n{err}")
+        else:
+             messagebox.showerror("Erro de Banco de Dados", f"Erro ao executar query:\n{err}")
+        resultado = None
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+    return resultado
+
+# --- Funções Específicas de Negócio ---
+
+def buscar_colaboradores():
+    query = "SELECT id, nome, registro, email FROM colaboradores ORDER BY nome"
+    return executar_query(query, fetch_all=True)
+
+def buscar_colaborador_por_id(colaborador_id):
+    query = "SELECT id, nome, registro, email FROM colaboradores WHERE id = %s"
+    return executar_query(query, (colaborador_id,), fetch_one=True)
+
+def salvar_colaborador_db(colaborador_id, nome, registro, email, senha):
+    """Salva (insere ou atualiza) colaborador. Retorna True em sucesso, False em falha."""
+    senha_hash = None
+    if senha:
+        try:
+            senha_hash = bcrypt.hash(senha)
+        except Exception as e:
+            messagebox.showerror("Erro de Hash", f"Erro ao gerar hash da senha: {e}")
+            return False
+
+    if colaborador_id: # Update
+        if senha_hash:
+            sql = "UPDATE colaboradores SET nome=%s, registro=%s, email=%s, senha_hash=%s WHERE id=%s"
+            params = (nome, registro, email, senha_hash, colaborador_id)
+        else:
+            sql = "UPDATE colaboradores SET nome=%s, registro=%s, email=%s WHERE id=%s"
+            params = (nome, registro, email, colaborador_id)
+        op = "atualizado"
+    else: # Insert
+        if not senha or not senha_hash:
+            messagebox.showwarning("Campo Obrigatório", "Senha é obrigatória para novo colaborador.")
+            return False
+        sql = "INSERT INTO colaboradores (nome, registro, email, senha_hash) VALUES (%s, %s, %s, %s)"
+        params = (nome, registro, email, senha_hash)
+        op = "inserido"
+
+    sucesso = executar_query(sql, params, commit=True)
+    if sucesso is not None and sucesso is not False:
+        messagebox.showinfo("Sucesso", f"Colaborador {op} com sucesso!")
+        return True
+    return False
+
+def excluir_colaborador_db(colaborador_id):
+    """Exclui colaborador. Retorna True em sucesso, False em falha."""
+    if not messagebox.askyesno("Confirmar Exclusão", f"Tem certeza que deseja excluir o colaborador ID {colaborador_id}? Isso desvinculará seus cartões RFID associados."):
+        return False
+
+    sql_update = "UPDATE cartoes_rfid SET colaborador_id = NULL WHERE colaborador_id = %s"
+    executar_query(sql_update, (colaborador_id,), commit=True)
+
+    sql_delete = "DELETE FROM colaboradores WHERE id = %s"
+    if executar_query(sql_delete, (colaborador_id,), commit=True) is not None:
+        messagebox.showinfo("Sucesso", f"Colaborador ID {colaborador_id} excluído.")
+        return True
+    return False
+
+def buscar_cartoes_por_colaborador(colaborador_id):
+    query = "SELECT id, uid, descricao, ativo FROM cartoes_rfid WHERE colaborador_id = %s ORDER BY id"
+    return executar_query(query, (colaborador_id,), fetch_all=True)
+
+def adicionar_cartao_rfid(colaborador_id, uid, descricao):
+    """Adiciona cartão. Retorna True/False e mensagem."""
+    if not uid: return False, "UID do cartão não pode ser vazio."
+    query = "INSERT INTO cartoes_rfid (uid, colaborador_id, descricao, ativo) VALUES (%s, %s, %s, TRUE)"
+    params = (uid, colaborador_id, descricao)
+    if executar_query(query, params, commit=True) is not None:
+        return True, "Cartão adicionado com sucesso."
+    else:
+        return False, "Falha ao adicionar cartão (verifique se UID já existe ou outro erro)."
+
+def atualizar_status_cartao(cartao_id, ativo):
+    """Ativa/Desativa cartão. Retorna True/False."""
+    query = "UPDATE cartoes_rfid SET ativo = %s WHERE id = %s"
+    return executar_query(query, (ativo, cartao_id), commit=True) is not None
+
+def desvincular_cartao(cartao_id):
+    """Desvincula cartão. Retorna True/False."""
+    query = "UPDATE cartoes_rfid SET colaborador_id = NULL WHERE id = %s"
+    return executar_query(query, (cartao_id,), commit=True) is not None
+
+def buscar_registros_ponto(data_inicio, data_fim, colaborador_id=None):
+    """Busca registros de ponto com filtros."""
+    params = [data_inicio, data_fim]
+    # Query com JOIN para buscar nome e matrícula
+    query = """
+        SELECT r.id, r.timestamp_batida, r.tipo_batida, r.identificador_batida,
+               c.nome as nome_colaborador, c.registro as matricula_colaborador
+        FROM registros_ponto r
+        LEFT JOIN colaboradores c ON r.colaborador_id = c.id
+        WHERE r.timestamp_batida BETWEEN %s AND %s
+    """
+    if colaborador_id:
+        query += " AND r.colaborador_id = %s"
+        params.append(colaborador_id)
+
+    query += " ORDER BY r.timestamp_batida DESC"
+
+    return executar_query(query, tuple(params), fetch_all=True)
+
+# --- Validações ---
+def validate_email(email):
+    """Valida formato básico de email usando regex."""
+    if not email: return True
+    pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+    if re.match(pattern, email):
+        return True
+    else:
+        messagebox.showwarning("Validação", "Formato de email inválido.")
+        return False
+
+def validate_not_empty(field_name, value):
+    """Verifica se um campo não está vazio."""
+    if not value or not str(value).strip():
+        messagebox.showwarning("Campo Obrigatório", f"O campo '{field_name}' não pode estar vazio.")
+        return False
+    return True
+
+# --- Classe Principal da Aplicação ---
+class AdminApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Admin Relógio Ponto")
+        # self.geometry("850x600") # Removido para usar maximizado
+
+        # --- Maximizar/Tela Cheia ---
+        try:
+            self.state('zoomed')
+            print("DEBUG: Janela definida para estado 'zoomed'.")
+        except tk.TclError:
+            print("AVISO: Estado 'zoomed' não suportado, tentando tamanho grande.")
+            try:
+                largura = self.winfo_screenwidth()
+                altura = self.winfo_screenheight()
+                self.geometry(f"{largura}x{altura}+0+0")
+                print(f"DEBUG: Definindo geometria manual para {largura}x{altura}.")
+            except tk.TclError:
+                 print("AVISO: Não foi possível definir tamanho grande. Usando padrão.")
+                 self.geometry("1024x700")
+        # --------------------------------------------
+
+        # Estilo ttk (opcional, para melhorar aparência)
+        style = ttk.Style(self)
+        try:
+            # Tenta usar um tema visualmente mais agradável se disponível
+            style.theme_use('vista') # 'clam', 'alt', 'default', 'classic', 'vista', 'xpnative'
+        except tk.TclError:
+            print("AVISO: Tema ttk 'vista' não encontrado, usando tema padrão.")
+            style.theme_use('default') # Fallback para um tema que sempre existe
+
+        self._criar_widgets()
+        self.carregar_colaboradores_na_lista() # Carrega ao iniciar
+
+    def _criar_widgets(self):
+        # Abas
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(pady=10, padx=10, expand=True, fill="both")
+
+        # --- Aba Colaboradores ---
+        self.frame_colaboradores = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(self.frame_colaboradores, text=' Colaboradores ') # Espaços para padding
+        self._criar_aba_colaboradores()
+
+        # --- Aba Relatórios ---
+        self.frame_relatorios = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(self.frame_relatorios, text=' Relatório de Pontos ')
+        self._criar_aba_relatorios()
+
+
+    def _criar_aba_colaboradores(self):
+        # Frame da Tabela
+        frame_tabela = ttk.LabelFrame(self.frame_colaboradores, text="Lista de Colaboradores", padding="10")
+        frame_tabela.pack(expand=True, fill='both', pady=(0, 10))
+
+        # Tabela (Treeview)
+        colunas = ('id', 'nome', 'registro', 'email')
+        self.tree_colaboradores = ttk.Treeview(frame_tabela, columns=colunas, show='headings', height=15, selectmode="browse")
+        self.tree_colaboradores.heading('id', text='ID')
+        self.tree_colaboradores.heading('nome', text='Nome')
+        self.tree_colaboradores.heading('registro', text='Matrícula')
+        self.tree_colaboradores.heading('email', text='Email')
+        self.tree_colaboradores.column('id', width=50, anchor=tk.CENTER, stretch=tk.NO)
+        self.tree_colaboradores.column('nome', width=300)
+        self.tree_colaboradores.column('registro', width=100, anchor=tk.CENTER)
+        self.tree_colaboradores.column('email', width=250)
+
+        # Adiciona evento de duplo clique para editar
+        self.tree_colaboradores.bind("<Double-1>", lambda event: self.on_editar_colaborador())
+
+
+        # Scrollbar
+        scrollbar = ttk.Scrollbar(frame_tabela, orient=tk.VERTICAL, command=self.tree_colaboradores.yview)
+        self.tree_colaboradores.configure(yscroll=scrollbar.set)
+        self.tree_colaboradores.grid(row=0, column=0, sticky='nsew')
+        scrollbar.grid(row=0, column=1, sticky='ns')
+        frame_tabela.grid_rowconfigure(0, weight=1)
+        frame_tabela.grid_columnconfigure(0, weight=1) # Corrigido aqui também!
+
+        # Frame dos Botões
+        frame_botoes = ttk.Frame(self.frame_colaboradores)
+        frame_botoes.pack(fill='x', pady=5)
+
+        btn_novo = ttk.Button(frame_botoes, text="Novo Colaborador", command=self.on_novo_colaborador, width=20)
+        btn_novo.pack(side=tk.LEFT, padx=5)
+        btn_editar = ttk.Button(frame_botoes, text="Editar Selecionado", command=self.on_editar_colaborador, width=20)
+        btn_editar.pack(side=tk.LEFT, padx=5)
+        btn_excluir = ttk.Button(frame_botoes, text="Excluir Selecionado", command=self.on_excluir_colaborador, width=20)
+        btn_excluir.pack(side=tk.LEFT, padx=5)
+        btn_atualizar = ttk.Button(frame_botoes, text="Atualizar Lista", command=self.carregar_colaboradores_na_lista, width=20)
+        btn_atualizar.pack(side=tk.RIGHT, padx=5)
+
+    def _criar_aba_relatorios(self):
+        # Adiciona um botão simples para abrir a janela de relatório
+        frame_interno = ttk.Frame(self.frame_relatorios, padding="20")
+        frame_interno.pack(expand=True)
+        btn_abrir_relatorio = ttk.Button(frame_interno, text="Gerar Relatório de Pontos", command=self.abrir_janela_relatorio, width=30)
+        btn_abrir_relatorio.pack(pady=20)
+
+
+    def carregar_colaboradores_na_lista(self):
+        """Limpa e recarrega a lista de colaboradores na Treeview principal."""
+        for item in self.tree_colaboradores.get_children():
+            self.tree_colaboradores.delete(item)
+        lista_colabs = buscar_colaboradores()
+        if lista_colabs:
+            for colab in lista_colabs:
+                # Usa get com valor padrão para evitar erro se coluna for NULL
+                valores = (colab['id'], colab['nome'], colab.get('registro', ''), colab.get('email', ''))
+                self.tree_colaboradores.insert('', tk.END, values=valores)
+
+    def on_novo_colaborador(self):
+        # Passa 'self' (a instância de AdminApp) como pai
+        JanelaFormColaborador(self)
+
+    def on_editar_colaborador(self):
+        selecionado = self.tree_colaboradores.focus() # Pega o item ID interno da Treeview
+        if not selecionado:
+            messagebox.showwarning("Nenhuma Seleção", "Por favor, selecione um colaborador na lista para editar.")
+            return
+        dados_item = self.tree_colaboradores.item(selecionado)
+        try:
+            # O ID do colaborador é o primeiro valor na lista 'values' do item
+            colaborador_id = dados_item['values'][0]
+            JanelaFormColaborador(self, colaborador_id) # Passa o ID para abrir em modo "Editar"
+        except (IndexError, TypeError):
+             messagebox.showerror("Erro", "Não foi possível obter o ID do colaborador selecionado.")
+
+    def on_excluir_colaborador(self):
+        selecionado = self.tree_colaboradores.focus()
+        if not selecionado:
+            messagebox.showwarning("Nenhuma Seleção", "Por favor, selecione um colaborador na lista para excluir.")
+            return
+        dados_item = self.tree_colaboradores.item(selecionado)
+        try:
+            colaborador_id = dados_item['values'][0]
+            if excluir_colaborador_db(colaborador_id):
+                self.carregar_colaboradores_na_lista() # Atualiza a lista se a exclusão foi bem sucedida
+        except (IndexError, TypeError):
+             messagebox.showerror("Erro", "Não foi possível obter o ID do colaborador selecionado para exclusão.")
+
+    def abrir_janela_relatorio(self):
+         # Passa a referência da janela principal (self) para a janela de relatório
+         JanelaRelatorioPontos(self)
+
+# --- Janela de Formulário Colaborador (Toplevel) ---
+class JanelaFormColaborador(tk.Toplevel):
+    def __init__(self, parent_app, colaborador_id=None):
+        super().__init__(parent_app)
+        self.parent_app = parent_app # Referência à janela principal AdminApp
+        self.colaborador_id = colaborador_id
+
+        # Configurações da Janela Toplevel
+        is_editing = bool(self.colaborador_id)
+        self.title("Novo Colaborador" if not is_editing else f"Editar Colaborador ID: {self.colaborador_id}")
+        self.geometry("600x550") # Ajustado para caber RFID
+        self.resizable(False, False)
+        self.transient(parent_app) # Mantém sobre a janela principal
+        self.grab_set() # Modal: impede interação com a janela principal
+
+        # Variáveis Tkinter
+        self.var_nome = tk.StringVar()
+        self.var_registro = tk.StringVar()
+        self.var_email = tk.StringVar()
+        self.var_senha = tk.StringVar()
+        self.var_novo_uid = tk.StringVar()
+        self.var_nova_desc_rfid = tk.StringVar()
+
+        # Carregar dados existentes se estiver no modo de edição
+        if is_editing:
+            if not self.carregar_dados_edicao(): # Fecha se não conseguir carregar
+                 return
+
+        # Criar os widgets da interface
+        self._criar_widgets_form()
+        self._criar_widgets_rfid() # Cria a seção RFID (só mostra se estiver editando)
+        self._criar_widgets_botoes_acao() # Cria botões Salvar/Cancelar
+
+        # Carregar a lista de cartões RFID associados (se estiver editando)
+        self._carregar_lista_rfid() # Deve ser chamado após criar tree_rfid
+
+    def carregar_dados_edicao(self):
+        """Busca dados do colaborador no BD e preenche os campos. Retorna True se sucesso."""
+        dados = buscar_colaborador_por_id(self.colaborador_id)
+        if dados:
+            self.var_nome.set(dados.get('nome', ''))
+            self.var_registro.set(dados.get('registro', ''))
+            self.var_email.set(dados.get('email', ''))
+            return True
+        else:
+            messagebox.showerror("Erro", f"Não foi possível carregar dados do colaborador ID {self.colaborador_id}.", parent=self)
+            self.destroy()
+            return False
+
+    def _criar_widgets_form(self):
+        """Cria os campos de entrada para os dados do colaborador."""
+        frame_form = ttk.LabelFrame(self, text="Dados do Colaborador", padding="10")
+        frame_form.pack(expand=False, fill="x", side=tk.TOP, padx=10, pady=5)
+
+        ttk.Label(frame_form, text="Nome:*").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.entry_nome = ttk.Entry(frame_form, textvariable=self.var_nome, width=50)
+        self.entry_nome.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+
+        ttk.Label(frame_form, text="Matrícula:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.entry_registro = ttk.Entry(frame_form, textvariable=self.var_registro, width=50)
+        self.entry_registro.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+
+        ttk.Label(frame_form, text="Email:").grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        self.entry_email = ttk.Entry(frame_form, textvariable=self.var_email, width=50)
+        self.entry_email.grid(row=2, column=1, padx=5, pady=5, sticky="ew")
+
+        ttk.Label(frame_form, text="Senha:*").grid(row=3, column=0, padx=5, pady=5, sticky="w")
+        self.entry_senha = ttk.Entry(frame_form, textvariable=self.var_senha, show="*", width=50)
+        self.entry_senha.grid(row=3, column=1, padx=5, pady=5, sticky="ew")
+
+        senha_label_text = "(Obrigatória para novo cadastro)" if not self.colaborador_id else "(Deixe em branco para não alterar)"
+        ttk.Label(frame_form, text=senha_label_text, foreground="grey").grid(row=4, column=1, padx=5, sticky="w")
+
+        frame_form.grid_columnconfigure(1, weight=1)
+        self.entry_nome.focus_set()
+
+    def _criar_widgets_rfid(self):
+        """Cria a seção para gerenciar cartões RFID (visível apenas na edição)."""
+        if not self.colaborador_id:
+            return # Não cria esta seção se for um novo colaborador
+
+        self.rfid_frame = ttk.LabelFrame(self, text="Gerenciar Cartões RFID Associados", padding="10")
+        self.rfid_frame.pack(expand=True, fill="both", side=tk.TOP, padx=10, pady=5)
+
+        # Frame para Listagem e Ações
+        frame_lista_rfid = ttk.Frame(self.rfid_frame)
+        frame_lista_rfid.pack(fill='x', pady=(0,5), expand=True)
+
+        cols_rfid = ('id_rfid', 'uid', 'descricao', 'ativo')
+        self.tree_rfid = ttk.Treeview(frame_lista_rfid, columns=cols_rfid, show='headings', height=5, selectmode="browse") # Aumentei altura
+        self.tree_rfid.heading('id_rfid', text='ID')
+        self.tree_rfid.heading('uid', text='UID')
+        self.tree_rfid.heading('descricao', text='Descrição')
+        self.tree_rfid.heading('ativo', text='Ativo?')
+        self.tree_rfid.column('id_rfid', width=40, stretch=tk.NO)
+        self.tree_rfid.column('uid', width=180)
+        self.tree_rfid.column('descricao', width=180)
+        self.tree_rfid.column('ativo', width=60, anchor=tk.CENTER)
+
+        scrollbar_rfid = ttk.Scrollbar(frame_lista_rfid, orient=tk.VERTICAL, command=self.tree_rfid.yview)
+        self.tree_rfid.configure(yscroll=scrollbar_rfid.set)
+        self.tree_rfid.grid(row=0, column=0, sticky='nsew')
+        scrollbar_rfid.grid(row=0, column=1, sticky='ns')
+        frame_lista_rfid.grid_rowconfigure(0, weight=1)
+        frame_lista_rfid.grid_columnconfigure(0, weight=1)
+
+        # Botões de Ação para RFID
+        botoes_rfid_frame = ttk.Frame(self.rfid_frame)
+        botoes_rfid_frame.pack(fill='x', pady=5)
+        ttk.Button(botoes_rfid_frame, text="Ativar/Desativar Selecionado", command=self.on_toggle_rfid).pack(side=tk.LEFT, padx=2)
+        ttk.Button(botoes_rfid_frame, text="Desvincular Selecionado", command=self.on_desvincular_rfid).pack(side=tk.LEFT, padx=2)
+
+        # Frame para Adicionar novo cartão
+        add_rfid_frame = ttk.Frame(self.rfid_frame)
+        add_rfid_frame.pack(fill='x', pady=5)
+        ttk.Label(add_rfid_frame, text="Novo UID:").pack(side=tk.LEFT, padx=2)
+        self.entry_novo_uid = ttk.Entry(add_rfid_frame, textvariable=self.var_novo_uid, width=20)
+        self.entry_novo_uid.pack(side=tk.LEFT, padx=2)
+        ttk.Label(add_rfid_frame, text="Descrição:").pack(side=tk.LEFT, padx=2)
+        self.entry_nova_desc_rfid = ttk.Entry(add_rfid_frame, textvariable=self.var_nova_desc_rfid, width=20)
+        self.entry_nova_desc_rfid.pack(side=tk.LEFT, padx=2)
+        ttk.Button(add_rfid_frame, text="Adicionar Cartão", command=self.on_adicionar_rfid).pack(side=tk.LEFT, padx=5)
+
+
+    def _criar_widgets_botoes_acao(self):
+        """Cria os botões Salvar e Cancelar."""
+        frame_botoes_form = ttk.Frame(self, padding="10")
+        # Garante que fique abaixo de tudo, mesmo da seção RFID
+        frame_botoes_form.pack(fill='x', side=tk.BOTTOM)
+
+        btn_salvar = ttk.Button(frame_botoes_form, text="Salvar Colaborador", command=self.salvar)
+        btn_salvar.pack(side=tk.RIGHT, padx=5)
+        btn_cancelar = ttk.Button(frame_botoes_form, text="Cancelar", command=self.destroy)
+        btn_cancelar.pack(side=tk.RIGHT)
+
+    def _carregar_lista_rfid(self):
+        """Carrega e exibe os cartões RFID associados a este colaborador."""
+        if not self.colaborador_id or not hasattr(self, 'tree_rfid'): return
+        for item in self.tree_rfid.get_children():
+            self.tree_rfid.delete(item)
+        lista_cartoes = buscar_cartoes_por_colaborador(self.colaborador_id)
+        if lista_cartoes:
+            for cartao in lista_cartoes:
+                 ativo_bool = cartao.get('ativo', False) # Pega booleano ou int
+                 ativo_str = "Sim" if ativo_bool else "Não"
+                 valores = (cartao['id'], cartao['uid'], cartao.get('descricao', ''), ativo_str)
+                 self.tree_rfid.insert('', tk.END, values=valores)
+
+    def salvar(self):
+        """Coleta dados do form, valida e chama a função de salvar no DB."""
+        nome = self.var_nome.get().strip()
+        registro = self.var_registro.get().strip()
+        email = self.var_email.get().strip()
+        senha = self.var_senha.get().strip() # Senha em texto puro
+
+        # Validações
+        if not validate_not_empty("Nome", nome): return
+        if not validate_email(email): return
+        if not self.colaborador_id and not validate_not_empty("Senha", senha): return # Senha obrigatória só para novos
+
+        # Chama a função de salvar no banco
+        if salvar_colaborador_db(self.colaborador_id, nome, registro, email, senha):
+            self.destroy() # Fecha esta janela
+            self.parent_app.carregar_colaboradores_na_lista() # Atualiza lista principal
+
+    def on_adicionar_rfid(self):
+        """Lida com o clique no botão Adicionar Cartão."""
+        uid = self.var_novo_uid.get().strip().upper()
+        desc = self.var_nova_desc_rfid.get().strip()
+        if not validate_not_empty("Novo UID", uid): return
+
+        sucesso, msg = adicionar_cartao_rfid(self.colaborador_id, uid, desc)
+        messagebox.showinfo("Adicionar Cartão", msg, parent=self)
+        if sucesso:
+             self.var_novo_uid.set("")
+             self.var_nova_desc_rfid.set("")
+             self._carregar_lista_rfid()
+
+    def _obter_cartao_selecionado(self):
+        """Retorna o ID e o status atual (Sim/Não) do cartão selecionado."""
+        if not hasattr(self, 'tree_rfid'): return None, None
+        selecionado = self.tree_rfid.focus()
+        if not selecionado:
+              messagebox.showwarning("Nenhuma Seleção", "Selecione um cartão RFID na lista.", parent=self)
+              return None, None
+        dados_item = self.tree_rfid.item(selecionado)
+        try:
+            cartao_id = dados_item['values'][0]
+            status_atual_str = dados_item['values'][3]
+            return cartao_id, status_atual_str
+        except (IndexError, TypeError):
+            messagebox.showerror("Erro", "Não foi possível obter dados do cartão selecionado.", parent=self)
+            return None, None
+
+    def on_toggle_rfid(self):
+        """Ativa ou desativa o cartão RFID selecionado."""
+        cartao_id, status_atual_str = self._obter_cartao_selecionado()
+        if cartao_id is None: return
+
+        novo_status = (status_atual_str == "Não") # Se for "Não", novo status é True
+
+        if atualizar_status_cartao(cartao_id, novo_status):
+            acao = "ativado" if novo_status else "desativado"
+            messagebox.showinfo("Sucesso", f"Cartão ID {cartao_id} {acao}.", parent=self)
+            self._carregar_lista_rfid()
+        else:
+             messagebox.showerror("Erro", f"Não foi possível alterar status do Cartão ID {cartao_id}.", parent=self)
+
+
+    def on_desvincular_rfid(self):
+        """Desvincula o cartão RFID selecionado do colaborador."""
+        cartao_id, _ = self._obter_cartao_selecionado()
+        if cartao_id is None: return
+
+        if messagebox.askyesno("Confirmar", f"Tem certeza que deseja desvincular o cartão ID {cartao_id} deste colaborador?", parent=self):
+             if desvincular_cartao(cartao_id):
+                  messagebox.showinfo("Sucesso", f"Cartão ID {cartao_id} desvinculado.", parent=self)
+                  self._carregar_lista_rfid()
+             else:
+                  messagebox.showerror("Erro", f"Não foi possível desvincular o Cartão ID {cartao_id}.", parent=self)
+
+
+# --- Janela de Relatório de Pontos (Toplevel) ---
+class JanelaRelatorioPontos(tk.Toplevel):
+    def __init__(self, parent_app):
+        super().__init__(parent_app)
+        self.title("Relatório de Batidas de Ponto")
+        self.geometry("950x600")
+        self.transient(parent_app)
+        self.grab_set()
+
+        # Carrega a lista de colaboradores para o filtro
+        self.colaboradores = self._carregar_lista_simples_colaboradores()
+
+        # Cria os widgets da interface de relatório
+        self._criar_widgets_relatorio()
+        # Gera relatório inicial com datas padrão (opcional)
+        self.gerar_relatorio()
+
+    def _carregar_lista_simples_colaboradores(self):
+        """Busca IDs e Nomes dos colaboradores para o ComboBox."""
+        lista = [{"id": None, "nome": "(Todos)"}] # Opção para todos
+        colabs_db = executar_query("SELECT id, nome FROM colaboradores ORDER BY nome", fetch_all=True)
+        if colabs_db:
+            lista.extend(colabs_db)
+        return lista
+
+    def _criar_widgets_relatorio(self):
+        """Cria os filtros e a tabela de resultados."""
+        # Frame de Filtros
+        frame_filtros = ttk.LabelFrame(self, text="Filtros do Relatório", padding="10")
+        frame_filtros.pack(fill='x', padx=10, pady=5)
+
+        # Filtro Colaborador
+        ttk.Label(frame_filtros, text="Colaborador:").pack(side=tk.LEFT, padx=(0, 5))
+        nomes_colaboradores = [c['nome'] for c in self.colaboradores]
+        self.combo_colaborador = ttk.Combobox(frame_filtros, values=nomes_colaboradores, width=30, state="readonly")
+        if nomes_colaboradores:
+            self.combo_colaborador.current(0)
+        self.combo_colaborador.pack(side=tk.LEFT, padx=5)
+
+        # Filtro Data Início
+        ttk.Label(frame_filtros, text="Data Início:").pack(side=tk.LEFT, padx=(10, 5))
+        self.date_inicio = DateEntry(frame_filtros, width=11, locale='pt_BR',
+                                     date_pattern='dd/MM/yyyy', # Padrão brasileiro
+                                     borderwidth=2)
+        self.date_inicio.pack(side=tk.LEFT, padx=5)
+
+        # Filtro Data Fim
+        ttk.Label(frame_filtros, text="Data Fim:").pack(side=tk.LEFT, padx=(10, 5))
+        self.date_fim = DateEntry(frame_filtros, width=11, locale='pt_BR',
+                                  date_pattern='dd/MM/yyyy',
+                                  borderwidth=2)
+        self.date_fim.set_date(datetime.now().date()) # Padrão data de hoje
+        self.date_fim.pack(side=tk.LEFT, padx=5)
+
+        # Botão Gerar
+        btn_gerar = ttk.Button(frame_filtros, text="Gerar Relatório", command=self.gerar_relatorio)
+        btn_gerar.pack(side=tk.LEFT, padx=(15, 0))
+
+        # Frame da Tabela de Resultados
+        self.frame_resultados = ttk.LabelFrame(self, text="Registros Encontrados", padding="10")
+        self.frame_resultados.pack(expand=True, fill='both', padx=10, pady=5)
+
+        # Tabela (Treeview) para Resultados
+        colunas_relatorio = ('data_hora', 'nome', 'matricula', 'tipo', 'identificador')
+        self.tree_relatorio = ttk.Treeview(self.frame_resultados, columns=colunas_relatorio, show='headings', height=20)
+        self.tree_relatorio.heading('data_hora', text='Data/Hora Batida')
+        self.tree_relatorio.heading('nome', text='Nome Colaborador')
+        self.tree_relatorio.heading('matricula', text='Matrícula')
+        self.tree_relatorio.heading('tipo', text='Tipo Batida')
+        self.tree_relatorio.heading('identificador', text='Cartão/Matrícula Batida')
+
+        # Larguras das colunas
+        self.tree_relatorio.column('data_hora', width=160, anchor=tk.CENTER)
+        self.tree_relatorio.column('nome', width=250)
+        self.tree_relatorio.column('matricula', width=100, anchor=tk.CENTER)
+        self.tree_relatorio.column('tipo', width=80, anchor=tk.CENTER)
+        self.tree_relatorio.column('identificador', width=180)
+
+        # Scrollbar para Resultados
+        scrollbar_rel = ttk.Scrollbar(self.frame_resultados, orient=tk.VERTICAL, command=self.tree_relatorio.yview)
+        self.tree_relatorio.configure(yscroll=scrollbar_rel.set)
+        self.tree_relatorio.grid(row=0, column=0, sticky='nsew')
+        scrollbar_rel.grid(row=0, column=1, sticky='ns')
+        self.frame_resultados.grid_rowconfigure(0, weight=1)
+        self.frame_resultados.grid_columnconfigure(0, weight=1)
+
+
+    def gerar_relatorio(self):
+        """Busca e exibe os registros de ponto com base nos filtros."""
+        # Limpa resultados anteriores
+        for item in self.tree_relatorio.get_children():
+            self.tree_relatorio.delete(item)
+
+        # Pega valores dos filtros
+        try:
+            # Converte data do DateEntry para formato YYYY-MM-DD HH:MM:SS
+            data_inicio = self.date_inicio.get_date()
+            data_inicio_str = datetime.combine(data_inicio, datetime.min.time()).strftime('%Y-%m-%d %H:%M:%S')
+
+            data_fim = self.date_fim.get_date()
+            data_fim_str = datetime.combine(data_fim, datetime.max.time().replace(microsecond=0)).strftime('%Y-%m-%d %H:%M:%S')
+
+            if data_inicio > data_fim:
+                 messagebox.showwarning("Datas Inválidas", "A data de início não pode ser posterior à data de fim.", parent=self)
+                 return
+
+        except Exception as e:
+             messagebox.showerror("Erro de Data", f"Formato de data inválido ou data não selecionada: {e}", parent=self)
+             return
+
+        colab_selecionado_nome = self.combo_colaborador.get()
+        colab_id_filtro = None
+        if colab_selecionado_nome and colab_selecionado_nome != "(Todos)":
+            for c in self.colaboradores:
+                if c['nome'] == colab_selecionado_nome:
+                    colab_id_filtro = c['id']
+                    break
+            if colab_id_filtro is None:
+                 messagebox.showerror("Erro", f"Colaborador '{colab_selecionado_nome}' não encontrado.", parent=self)
+                 return
+
+        # Busca os dados no banco
+        registros = buscar_registros_ponto(data_inicio_str, data_fim_str, colab_id_filtro)
+
+        # Popula a tabela de resultados
+        count = 0
+        if registros:
+            for reg in registros:
+                ts_batida = reg.get('timestamp_batida')
+                timestamp_fmt = ts_batida.strftime('%d/%m/%Y %H:%M:%S') if isinstance(ts_batida, datetime) else str(ts_batida)
+
+                valores = (
+                    timestamp_fmt,
+                    reg.get('nome_colaborador', 'N/A'),
+                    reg.get('matricula_colaborador', 'N/A'), # Matrícula vinda do JOIN
+                    reg.get('tipo_batida', ''),
+                    reg.get('identificador_batida', '')
+                )
+                self.tree_relatorio.insert('', tk.END, values=valores)
+                count += 1
+
+        # Atualiza título do frame com contagem
+        self.frame_resultados.config(text=f"Registros Encontrados ({count})")
+
+
+# --- Execução Principal ---
+if __name__ == "__main__":
+    # Verifica conexão inicial com BD antes de abrir a GUI
+    print("Verificando conexão inicial com o banco de dados...")
+    conn_teste = conectar_db()
+    if conn_teste:
+        conn_teste.close()
+        print("Conexão OK. Iniciando aplicação...")
+        # Garante que a aplicação Tkinter rode
+        try:
+            app = AdminApp()
+            app.mainloop()
+        except Exception as e:
+             print(f"Erro ao iniciar a aplicação Tkinter: {e}")
+             messagebox.showerror("Erro Fatal GUI", f"Não foi possível iniciar a interface gráfica:\n{e}")
+    else:
+        print("\nERRO CRÍTICO: Não foi possível conectar ao banco de dados na inicialização.")
+        print("Verifique se o servidor MySQL está rodando e se as credenciais em DB_CONFIG estão corretas.")
+        try:
+             # Tenta mostrar um erro mesmo se o loop principal não iniciar
+             root_err = tk.Tk()
+             root_err.withdraw()
+             messagebox.showerror("Erro Crítico de Banco de Dados",
+                                  "Não foi possível conectar ao MySQL.\nVerifique se o servidor está rodando e as configurações estão corretas.\nA aplicação será fechada.")
+        except tk.TclError:
+             print("Não foi possível nem mostrar a messagebox de erro Tkinter.")
