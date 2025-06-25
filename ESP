@@ -1,0 +1,177 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClient.h>
+#include <ArduinoJson.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <time.h> // Para formatar a hora
+
+// --- Configurações (ALTERE COM SEUS DADOS!) ---
+const char* ssid = "A25 de Rafael";
+const char* password = "12345678";
+String serverAddress = "http://192.168.166.99:5000"; // <<< USE O IP ATUAL DO SEU PC!
+
+// --- Configurações de NTP ---
+const long utcOffsetInSeconds = -3 * 3600; // Fuso Horário de Brasília (GMT-3)
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", utcOffsetInSeconds);
+
+// --- SETUP ---
+void setup() {
+  Serial.begin(9600);
+  Serial.println(F("\nESP8266 (Online-Only) Iniciado."));
+  connectToWiFi();
+  
+  if(WiFi.status() == WL_CONNECTED) {
+    Serial.println(F("Iniciando cliente NTP..."));
+    timeClient.begin();
+  }
+}
+
+// --- LOOP ---
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectToWiFi();
+    delay(1000);
+    return;
+  }
+  timeClient.update();
+
+  if (Serial.available() > 0) {
+    String dataFromArduino = Serial.readStringUntil('\n');
+    dataFromArduino.trim();
+    processAndSendData(dataFromArduino);
+  }
+}
+
+// --- Funções ---
+
+void connectToWiFi() {
+  static unsigned long lastReconnectAttempt = 0;
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastReconnectAttempt < 10000 && lastReconnectAttempt != 0) {
+     return;
+  }
+  lastReconnectAttempt = currentMillis;
+
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.print("ESP8266: Conectando a rede WiFi '"); Serial.print(ssid); Serial.println("'...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(F("ESP8266: WiFi Conectado!"));
+    Serial.print(F("ESP8266: Endereco IP: ")); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println(F("ESP8266: Falha ao conectar no WiFi."));
+    WiFi.disconnect();
+  }
+}
+
+void processAndSendData(String data) {
+  Serial.print("ESP8266 DBG: Recebido do Arduino -> "); Serial.println(data);
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("STATUS:ERR_WIFI");
+    return;
+  }
+
+  unsigned long epochTime = timeClient.getEpochTime();
+  while (epochTime < 10000) { // Checagem simples se a hora é válida, tenta atualizar
+      Serial.println("Aguardando sincronia NTP...");
+      timeClient.update();
+      epochTime = timeClient.getEpochTime();
+      delay(500);
+  }
+  
+  time_t rawtime = epochTime;
+  struct tm * timeinfo;
+  timeinfo = localtime(&rawtime);
+  char timestamp_buffer[20];
+  strftime(timestamp_buffer, sizeof(timestamp_buffer), "%Y-%m-%dT%H:%M:%S", timeinfo);
+  String timestamp = String(timestamp_buffer);
+
+  String type = getValue(data, "TYPE=");
+  String uid = getValue(data, "UID=");
+  String matricula = getValue(data, "MAT=");
+  String senha = getValue(data, "SEN=");
+
+  StaticJsonDocument<256> jsonDoc;
+  String jsonPayload;
+  jsonDoc["timestamp"] = timestamp;
+
+  if (type == "RFID" && uid != "") {
+    jsonDoc["uid"] = uid;
+  } else if (type == "KEYPAD" && matricula != "" && senha != "") {
+    jsonDoc["matricula"] = matricula;
+    jsonDoc["senha"] = senha;
+  } else {
+    Serial.println("STATUS:ERR_DATA");
+    return;
+  }
+
+  serializeJson(jsonDoc, jsonPayload);
+  Serial.print("ESP8266 DBG: Enviando JSON para API -> "); Serial.println(jsonPayload);
+  sendDataToApi(jsonPayload);
+}
+
+// *** FUNÇÃO getValue COMPLETA ***
+String getValue(String data, String key) {
+  int keyIndex = data.indexOf(key);
+  if (keyIndex == -1) {
+    return ""; // Chave não encontrada
+  }
+  int valueStartIndex = keyIndex + key.length();
+  int valueEndIndex = data.indexOf(';', valueStartIndex);
+  if (valueEndIndex == -1) {
+    valueEndIndex = data.length();
+  }
+  return data.substring(valueStartIndex, valueEndIndex);
+}
+
+// *** FUNÇÃO sendDataToApi COMPLETA ***
+void sendDataToApi(String jsonPayload) {
+  WiFiClient client;
+  HTTPClient http;
+  String serverPath = serverAddress + "/api/ponto";
+
+  Serial.print("ESP8266: Conectando a API em "); Serial.println(serverPath);
+
+  if (http.begin(client, serverPath)) {
+    http.addHeader("Content-Type", "application/json");
+    int httpCode = http.POST(jsonPayload);
+
+    if (httpCode > 0) {
+      Serial.printf("ESP8266: Codigo de resposta HTTP: %d\n", httpCode);
+      String responsePayload = http.getString();
+      Serial.print("ESP8266: Resposta da API: "); Serial.println(responsePayload);
+
+      StaticJsonDocument<128> responseDoc;
+      deserializeJson(responseDoc, responsePayload);
+      const char* status = responseDoc["status"];
+      if (status && strcmp(status, "sucesso") == 0) {
+           Serial.println("STATUS:OK");
+      } else {
+           const char* msg = responseDoc["mensagem"];
+           Serial.print("STATUS:ERR_API:");
+           Serial.println(msg ? msg : "Erro desconhecido");
+      }
+    } else {
+      Serial.printf("ESP8266: Falha no envio HTTP, erro: %s\n", http.errorToString(httpCode).c_str());
+      Serial.println("STATUS:ERR_HTTP");
+    }
+    http.end();
+  } else {
+    Serial.println("ESP8266: Nao foi possivel iniciar conexao HTTP com a API.");
+    Serial.println("STATUS:ERR_CONN");
+  }
+}
