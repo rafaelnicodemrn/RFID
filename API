@@ -1,0 +1,249 @@
+# api.py (Versão com Validação e Endpoint /api/validos)
+
+import mysql.connector
+from flask import Flask, request, jsonify
+from mysql.connector import Error
+from passlib.hash import bcrypt # Para verificar hash de senha
+# from datetime import datetime # Descomente se precisar de validação extra de timestamp
+
+# --- Configurações do Banco de Dados ---
+# Usando os dados que você forneceu
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'root',
+    'password': '8488', # Sua senha MySQL
+    'database': 'relogio_ponto'
+}
+
+# --- Funções Auxiliares do Banco de Dados ---
+# (Reutilizando a função genérica para simplificar)
+
+def conectar_db():
+    """Tenta conectar ao banco de dados e retorna o objeto de conexão."""
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG, use_pure=False)
+        return conn
+    except Error as err:
+        # Loga o erro no console do servidor
+        print(f"CRÍTICO: Falha ao conectar ao MySQL: {err}")
+        # Não mostra messagebox aqui, pois é um backend API
+        return None
+
+def executar_query(query, params=None, fetch_one=False, fetch_all=False, commit=False):
+    """Função genérica para executar queries SQL."""
+    conn = conectar_db()
+    if conn is None:
+        print("ERRO: Conexão com BD falhou antes de executar a query.")
+        return None # Indica falha na conexão
+    resultado = None
+    last_row_id = None
+    cursor = None
+    try:
+        cursor = conn.cursor(dictionary=True if (fetch_one or fetch_all) else False)
+        cursor.execute(query, params or ())
+
+        if commit:
+            conn.commit()
+            last_row_id = cursor.lastrowid
+            resultado = last_row_id if last_row_id else True # Sucesso na escrita
+        elif fetch_one:
+            resultado = cursor.fetchone()
+        elif fetch_all:
+            resultado = cursor.fetchall()
+
+    except Error as err:
+        if conn: conn.rollback()
+        print(f"Erro SQL: {err} | Query: {cursor.statement if cursor else 'N/A'}") # Log aprimorado
+        # Não mostra messagebox aqui
+        resultado = None # Indica falha
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
+
+    return resultado
+
+# --- Funções de Validação ---
+
+def validar_rfid(uid):
+    """Verifica se UID existe, está ativo e retorna dados do cartão/colaborador."""
+    if not uid: return None, "UID não fornecido."
+    sql = """
+        SELECT c.id as cartao_id, c.ativo, c.colaborador_id, col.nome as nome_colaborador
+        FROM cartoes_rfid c
+        LEFT JOIN colaboradores col ON c.colaborador_id = col.id
+        WHERE c.uid = %s
+    """
+    cartao = executar_query(sql, (uid,), fetch_one=True)
+
+    if not cartao:
+        return None, "Cartão RFID não encontrado."
+    if not cartao['ativo']:
+        return None, "Cartão RFID está inativo."
+    if not cartao['colaborador_id']:
+        return None, "Cartão RFID não está vinculado a um colaborador."
+
+    # Retorna o ID do colaborador e o nome (para possível log/mensagem)
+    return cartao['colaborador_id'], f"Colaborador: {cartao['nome_colaborador']}"
+
+def validar_matricula_senha(matricula, senha):
+    """Verifica matrícula e senha, retorna ID do colaborador se válido."""
+    if not matricula or not senha: return None, "Matrícula e Senha são obrigatórios."
+
+    sql = "SELECT id, nome, senha_hash FROM colaboradores WHERE registro = %s"
+    colaborador = executar_query(sql, (matricula,), fetch_one=True)
+
+    if not colaborador:
+        return None, "Matrícula não encontrada."
+    if not colaborador['senha_hash']:
+         # Segurança: não deve acontecer se senha é obrigatória, mas evita erro
+        print(f"ALERTA: Colaborador ID {colaborador['id']} com matrícula {matricula} não possui hash de senha.")
+        return None, "Problema de configuração de senha para esta matrícula."
+
+    # Verifica a senha usando passlib
+    try:
+        if bcrypt.verify(senha, colaborador['senha_hash']):
+            # Senha correta!
+            return colaborador['id'], f"Colaborador: {colaborador['nome']}"
+        else:
+            # Senha incorreta
+            return None, "Senha incorreta."
+    except Exception as e:
+        # Erro ao verificar hash (ex: hash inválido no banco)
+        print(f"Erro ao verificar hash para matrícula {matricula}: {e}")
+        return None, "Erro ao verificar credenciais."
+
+
+# Cria a instância da aplicação Flask
+app = Flask(__name__)
+
+# --- Endpoints da API ---
+
+@app.route('/api/ponto', methods=['POST'])
+def registrar_ponto():
+    """Recebe batida, valida e insere no banco."""
+    if not request.is_json:
+        return jsonify({"status": "erro", "mensagem": "Corpo da requisição deve ser JSON"}), 400
+
+    dados = request.get_json()
+    print(f"DEBUG: Dados recebidos -> {dados}")
+
+    uid_cartao = dados.get('uid')
+    matricula = dados.get('matricula')
+    senha = dados.get('senha')
+    timestamp_batida_str = dados.get('timestamp')
+
+    if not timestamp_batida_str:
+         return jsonify({"status": "erro", "mensagem": "'timestamp' é obrigatório."}), 400
+
+    colaborador_id = None
+    mensagem_validacao = "Não validado"
+    tipo_batida = None
+    identificador = None
+
+    # Tenta validar por RFID primeiro se UID foi enviado
+    if uid_cartao:
+        tipo_batida = 'RFID'
+        identificador = uid_cartao
+        colaborador_id, mensagem_validacao = validar_rfid(uid_cartao)
+        if colaborador_id is None:
+            print(f"Falha validação RFID: {mensagem_validacao}")
+            # Retorna erro específico de RFID inválido/não encontrado/inativo
+            return jsonify({"status": "erro", "mensagem": f"RFID: {mensagem_validacao}"}), 403 # 403 Forbidden ou 404 Not Found
+
+    # Se não validou por RFID, tenta validar por Matrícula/Senha se foram enviados
+    elif matricula and senha:
+        tipo_batida = 'TECLADO'
+        identificador = matricula
+        colaborador_id, mensagem_validacao = validar_matricula_senha(matricula, senha)
+        if colaborador_id is None:
+            print(f"Falha validação Teclado: {mensagem_validacao}")
+            # Retorna erro específico de matrícula/senha inválida
+            return jsonify({"status": "erro", "mensagem": f"Teclado: {mensagem_validacao}"}), 401 # 401 Unauthorized
+
+    # Se não conseguiu determinar um tipo válido ou validar
+    else:
+        return jsonify({"status": "erro", "mensagem": "Dados insuficientes para batida (requer 'uid' ou 'matricula'+'senha')."}), 400
+
+    # Se chegou aqui, a validação foi bem-sucedida e temos o colaborador_id
+    print(f"Validação OK. {mensagem_validacao}. Colaborador ID: {colaborador_id}")
+
+    # Inserir o registro de ponto associado ao colaborador
+    sql_insert = """
+        INSERT INTO registros_ponto
+        (identificador_batida, timestamp_batida, tipo_batida, colaborador_id, timestamp_servidor)
+        VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+    """
+    dados_insert = (
+        identificador,
+        timestamp_batida_str,
+        tipo_batida,
+        colaborador_id # ID encontrado na validação
+    )
+
+    insert_result = executar_query(sql_insert, dados_insert, commit=True)
+
+    if insert_result is not None:
+        print(f"Registro de ponto inserido com sucesso! ID: {insert_result}")
+        return jsonify({
+            "status": "sucesso",
+            "mensagem": f"Ponto registrado para {mensagem_validacao}.",
+            "registro_id": insert_result
+            }), 201
+    else:
+        print("ERRO: Falha ao inserir registro de ponto no banco após validação.")
+        # O erro específico do BD já foi logado por executar_query
+        return jsonify({"status": "erro", "mensagem": "Erro interno no servidor ao salvar o ponto."}), 500
+
+
+@app.route('/api/validos', methods=['GET'])
+def obter_validos():
+    """Retorna listas de UIDs de cartões ativos e Registros de colaboradores."""
+    uids_validos = []
+    registros_validos = []
+    status_code = 200
+
+    # Busca UIDs ativos e vinculados
+    sql_uids = "SELECT uid FROM cartoes_rfid WHERE ativo = TRUE AND colaborador_id IS NOT NULL"
+    resultado_uids = executar_query(sql_uids, fetch_all=True)
+    if resultado_uids is not None:
+        uids_validos = [item['uid'] for item in resultado_uids]
+    else:
+        # Falha ao buscar UIDs, mas talvez consiga buscar registros
+        print("ERRO ao buscar UIDs válidos.")
+        status_code = 500 # Indica erro parcial ou total
+
+    # Busca Registros (matrículas) de colaboradores (assume que todos cadastrados podem usar teclado)
+    # Poderia adicionar um campo 'ativo' na tabela colaboradores se necessário
+    sql_registros = "SELECT registro FROM colaboradores WHERE registro IS NOT NULL AND registro != ''"
+    resultado_registros = executar_query(sql_registros, fetch_all=True)
+    if resultado_registros is not None:
+        registros_validos = [item['registro'] for item in resultado_registros]
+    else:
+        # Falha ao buscar registros
+        print("ERRO ao buscar registros válidos.")
+        status_code = 500
+
+    # Monta a resposta final
+    resposta = {
+        "uids_validos": uids_validos,
+        "registros_validos": registros_validos
+    }
+
+    # Se houve erro em alguma consulta, retorna 500, senão 200
+    if status_code == 500:
+         resposta["status"] = "erro_parcial"
+         resposta["mensagem"] = "Erro ao buscar alguns dados de validação."
+
+    return jsonify(resposta), status_code
+
+
+# --- Roda o Servidor Flask ---
+if __name__ == '__main__':
+    print("Iniciando servidor Flask...")
+    print(f"Escutando em todas as interfaces de rede (0.0.0.0) na porta 5000")
+    print(f"Endpoint Ponto: http://<SEU_IP_LOCAL>:5000/api/ponto (POST)")
+    print(f"Endpoint Validos: http://<SEU_IP_LOCAL>:5000/api/validos (GET)")
+    print("Pressione CTRL+C para parar o servidor.")
+    app.run(host='0.0.0.0', port=5000, debug=True)
